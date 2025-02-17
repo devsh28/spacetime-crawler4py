@@ -9,10 +9,26 @@ from scraper import write_report
 
 def main(config_file, restart):
     try:
-        config = Config(ConfigParser())
+        # Create a ConfigParser instance and read the config file
+        config_parser = ConfigParser()
+        files_read = config_parser.read(config_file)
+        if not files_read:
+            raise FileNotFoundError(f"Configuration file '{config_file}' not found.")
+        
+        # Check if the IDENTIFICATION section exists
+        if "IDENTIFICATION" not in config_parser:
+            raise KeyError("Missing [IDENTIFICATION] section in configuration file.")
+        
+        # Instantiate your Config using the loaded config_parser
+        config = Config(config_parser)
         config.cache_server = get_cache_server(config, restart)
+        
+        # Start the crawler
         crawler = Crawler(config, restart)
         crawler.start()
+        
+    except Exception as e:
+        print("Error in configuration:", e)
     finally:
         write_report()
 
