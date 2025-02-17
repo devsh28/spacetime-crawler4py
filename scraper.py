@@ -29,6 +29,9 @@ stop_words = {
     "yourselves"
 }
 
+# -----------------------------
+# Word Analysis Function
+# -----------------------------
 def getWords(soup, lock, url, limit=50):
     """
     Extracts text from the BeautifulSoup object, cleans it,
@@ -62,6 +65,9 @@ def getWords(soup, lock, url, limit=50):
     
     return total_words
 
+# -----------------------------
+# Duplicate Detection Using Simhash (via numpy)
+# -----------------------------
 def update_duplicate_cache_np(url, simhash_val, lock, cache_file="dupe_cache.shelve", threshold=0.8):
     """
     Checks a shelve-based cache (with thread safety) for near-duplicate pages.
@@ -80,6 +86,9 @@ def update_duplicate_cache_np(url, simhash_val, lock, cache_file="dupe_cache.she
             cache[normalized] = simhash_val.tolist()
     return False
 
+# -----------------------------
+# URL Filtering and Link Extraction
+# -----------------------------
 def extract_links(soup, base_url):
     """
     Extracts all hyperlinks from the page.
@@ -95,6 +104,67 @@ def extract_links(soup, base_url):
         links.append(clean_url)
     return links
 
+# -----------------------------
+# Subdomain Analysis Functions
+# -----------------------------
+def update_subdomain_count(url, lock, subdomain_file="subdomains.shelve"):
+    """
+    Updates a shelve-based store for subdomain analysis.
+    For URLs under the ics.uci.edu domain, stores the unique URL (ignoring fragments)
+    under its subdomain (the netloc). This will be used to count unique pages per subdomain.
+    """
+    parsed = urlparse(url)
+    if parsed.netloc.lower().endswith("ics.uci.edu"):
+        subdomain = parsed.netloc.lower()
+        with lock, shelve.open(subdomain_file) as subdomains:
+            if subdomain in subdomains:
+                urls_set = subdomains[subdomain]
+                urls_set.add(url)
+                subdomains[subdomain] = urls_set
+            else:
+                subdomains[subdomain] = {url}
+
+def analyze_subdomains(lock, subdomain_file="subdomains.shelve"):
+    """
+    Returns a dictionary mapping each subdomain (from ics.uci.edu) to the number of unique pages.
+    """
+    with lock, shelve.open(subdomain_file) as subdomains:
+        return {subdomain: len(urls) for subdomain, urls in subdomains.items()}
+
+# -----------------------------
+# Infinite Trap Detection
+# -----------------------------
+def infinite_trap_detect(url):
+    """
+    Checks for potential infinite crawler traps based on repeated path segments
+    and date patterns in the path or query.
+    Returns True if the URL appears to be an infinite trap.
+    """
+    parsed = urlparse(url)
+    
+    # Check for repeated path segments
+    path_segments = [seg for seg in parsed.path.split("/") if seg]
+    segment_counts = {}
+    for seg in path_segments:
+        segment_counts[seg] = segment_counts.get(seg, 0) + 1
+        if segment_counts[seg] > 2:
+            return True
+
+    # Check for date patterns that may indicate calendar traps
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", parsed.query) is not None:
+        return True
+    if re.search(r"\b\d{4}-\d{2}\b", parsed.query) is not None:
+        return True
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", parsed.path) is not None:
+        return True
+    if re.search(r"\b\d{4}-\d{2}\b", parsed.path) is not None:
+        return True
+
+    return False
+
+# -----------------------------
+# Required Function Signatures
+# -----------------------------
 def scraper(url, resp):
     """
     Entry point for the crawler.
@@ -114,7 +184,9 @@ def extract_next_links(url, resp):
          if "nofollow" is present, update word statistics but do not extract links.
       4. Compute a simhash fingerprint (using EnhancedSimHash from simhash.py) and check for duplicates.
       5. Update word analysis (for reporting: longest page, common words).
-      6. Extract outbound links (defragmented and absolute).
+      6. Update subdomain analysis for pages under ics.uci.edu.
+      7. Check for infinite crawler traps.
+      8. Extract outbound links (defragmented and absolute).
     Returns a list of candidate hyperlinks.
     """
     if resp.status != 200:
@@ -138,6 +210,11 @@ def extract_next_links(url, resp):
             getWords(soup, lock, url)
             return []
     
+    # Infinite trap detection: check for repeated segments or date patterns.
+    if infinite_trap_detect(url):
+        logger.info(f"Skipping {url} due to potential infinite trap.")
+        return []
+    
     # Duplicate detection using EnhancedSimHash from simhash.py
     # Decode content to string for the simhash function.
     html_str = content.decode("utf-8", errors="ignore")
@@ -151,6 +228,9 @@ def extract_next_links(url, resp):
     page_word_count = getWords(soup, lock, url)
     logger.info(f"Processed {url} with {page_word_count} words.")
     
+    # Update subdomain analysis (for pages under ics.uci.edu)
+    update_subdomain_count(url, lock)
+    
     # Extract outbound links
     raw_links = extract_links(soup, resp.raw_response.url)
     return raw_links
@@ -158,12 +238,13 @@ def extract_next_links(url, resp):
 def is_valid(url):
     """
     Decide whether to crawl this URL or not.
-    Uniqueness is based solely on the URL (ignoring fragments).
+    Uniqueness is based solely on the URL (ignoring fragments) and avoiding traps.
     
     Conditions:
       - URL must use http or https.
       - URL must belong to one of the allowed UCI domains.
       - URL must not point to unwanted file types (based on file extension).
+      - URL must not trigger infinite crawler traps.
     """
     try:
         parsed = urlparse(url)
@@ -187,7 +268,75 @@ def is_valid(url):
         if re.match(ext_pattern, parsed.path.lower()):
             return False
 
+        # Additional infinite trap detection: Check for repeated path segments
+        path_segments = [seg for seg in parsed.path.split("/") if seg]
+        segment_counts = {}
+        for seg in path_segments:
+            segment_counts[seg] = segment_counts.get(seg, 0) + 1
+            if segment_counts[seg] > 2:
+                return False
+
+        # Include date pattern checks to avoid calendar traps:
+        if re.search(r"\b\d{4}-\d{2}-\d{2}\b", parsed.query) is not None:
+            return False
+        if re.search(r"\b\d{4}-\d{2}\b", parsed.query) is not None:
+            return False
+        if re.search(r"\b\d{4}-\d{2}-\d{2}\b", parsed.path) is not None:
+            return False
+        if re.search(r"\b\d{4}-\d{2}\b", parsed.path) is not None:
+            return False
+
         return True
     except TypeError:
         print("TypeError for ", parsed)
         raise
+
+def write_report(report_filename="report.txt"):
+    """
+    Generates a report with:
+      1. Total number of unique pages crawled.
+      2. The longest page (by word count) with its URL.
+      3. The 50 most common words with their counts.
+      4. The subdomain analysis for pages under ics.uci.edu.
+    The report is written to a text file.
+    """
+    # 1. Unique Pages: Count keys in the duplicate cache
+    with shelve.open("cache.shelve") as cache:
+        unique_count = len(cache)
+    
+    # 2. Longest Page: Read special key '*' from words.shelve
+    with shelve.open("words.shelve") as word_store:
+        longest_info = word_store.get('*', (0, "N/A"))
+        longest_count, longest_url = longest_info
+
+    # 3. 50 Most Common Words: Exclude the '*' key
+    words_freq = {}
+    with shelve.open("words.shelve") as word_store:
+        for key in word_store:
+            if key != '*':
+                words_freq[key] = word_store[key]
+    sorted_words = sorted(words_freq.items(), key=lambda x: x[1], reverse=True)
+    top_50_words = sorted_words[:50]
+
+    # 4. Subdomain Analysis: Count unique pages per subdomain from subdomains.shelve
+    with shelve.open("subdomains.shelve") as subdomains:
+        subdomain_dict = {k: len(v) for k, v in subdomains.items()}
+    sorted_subdomains = sorted(subdomain_dict.items(), key=lambda x: x[0])
+    subdomain_count = len(sorted_subdomains)
+
+    # Write the report to a file
+    with open(report_filename, "w") as f:
+        f.write(f"1. {unique_count} Unique Pages Crawled\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"2. Longest Page: {longest_url} with {longest_count} words\n")
+        f.write("=" * 100 + "\n")
+        f.write("3. 50 Most Common Words\n")
+        f.write("-" * 23 + "\n")
+        for word, freq in top_50_words:
+            f.write(f"{word} ({freq})\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"4. {subdomain_count} subdomains found\n")
+        f.write("-" * 25 + "\n")
+        for subdomain, count in sorted_subdomains:
+            f.write(f"{subdomain}, {count}\n")
+
