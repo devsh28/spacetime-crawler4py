@@ -2,14 +2,15 @@ import re
 import os
 import shelve
 import threading
+import numpy as np
 from urllib.parse import urlparse, urljoin, urldefrag, urlunparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 from utils import get_logger, get_urlhash
+from simhash import EnhancedSimHash  # Import your simhash class
+from collections import Counter
 
-# Global logger and lock
 logger = get_logger("SCRAPER", "SCRAPER")
 lock = threading.Lock()
-
 
 stop_words = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "arent", "as", "at",
@@ -35,87 +36,48 @@ def getWords(soup, lock, url, limit=50):
     Also tracks the longest page (via a special key '*').
     Returns the total word count (if above a threshold) or 0.
     """
-    file_exists = os.path.exists("words.shelve")
-    with lock:
-        with shelve.open("words.shelve") as word_store:
-            if not file_exists:
-                word_store['*'] = (0, None)  # (max_word_count, url)
-
-    text = soup.get_text(separator=" ", strip=True).lower()
-    english_text = re.sub(r"[^a-z\s]", "", text)
-    words = english_text.split()
-    words = [word for word in words if len(word) > 2]
-
-    num_words = len(words)
-    if num_words < limit:
+    # Ensure the shelve has been initialized with the special key '*'
+    with lock, shelve.open("words.shelve") as word_store:
+        if '*' not in word_store:
+            word_store['*'] = (0, None)  # (max_word_count, url)
+    
+    # Extract and clean text
+    raw_text = soup.get_text(separator=" ", strip=True).lower()
+    cleaned_text = re.sub(r"[^a-z\s]", "", raw_text)
+    tokens = [token for token in cleaned_text.split() if len(token) > 2]
+    
+    total_words = len(tokens)
+    if total_words < limit:
         return 0
 
-    counts = {}
-    for word in words:
-        if word in stop_words:
-            continue
-        counts[word] = counts.get(word, 0) + 1
+    # Count tokens that are not stop words
+    token_counts = Counter(token for token in tokens if token not in stop_words)
+    
+    # Update the persistent shelve with token frequencies and the longest page info
+    with lock, shelve.open("words.shelve") as word_store:
+        for token, count in token_counts.items():
+            word_store[token] = word_store.get(token, 0) + count
+        if total_words > word_store['*'][0]:
+            word_store['*'] = (total_words, url)
+    
+    return total_words
 
-    with lock:
-        with shelve.open("words.shelve") as word_store:
-            for word, count in counts.items():
-                if word not in word_store:
-                    word_store[word] = 0
-                word_store[word] += count
-            # Track the longest page seen so far
-            if num_words > word_store['*'][0]:
-                word_store['*'] = (num_words, url)
-    return num_words
-
-
-def compute_simhash(soup, hashbits=64):
+def update_duplicate_cache_np(url, simhash_val, lock, cache_file="dupe_cache.shelve", threshold=0.8):
     """
-    Computes a 64-bit simhash fingerprint from the page text.
-    This implementation tokenizes the text and builds a weighted fingerprint.
-    """
-    text = soup.get_text()
-    tokens = text.split()
-    freq = {}
-    for token in tokens:
-        token = token.lower()
-        freq[token] = freq.get(token, 0) + 1
-
-    v = [0] * hashbits
-    for token, weight in freq.items():
-        h = hash(token) & ((1 << hashbits) - 1)  # mask to 64 bits
-        for i in range(hashbits):
-            bitmask = 1 << i
-            if h & bitmask:
-                v[i] += weight
-            else:
-                v[i] -= weight
-
-    fingerprint = 0
-    for i in range(hashbits):
-        if v[i] >= 0:
-            fingerprint |= (1 << i)
-    return fingerprint
-
-def hamming_distance(x, y):
-    """Returns the Hamming distance between two integers."""
-    return bin(x ^ y).count("1")
-
-def is_duplicate(simhash1, simhash2, threshold=3):
-    """Returns True if the Hamming distance between two simhashes is within the threshold."""
-    return hamming_distance(simhash1, simhash2) <= threshold
-
-def update_duplicate_cache(url, simhash_val, lock, cache_file="dupe_cache.shelve"):
-    """
-    Checks a shelve-based cache (with thread safety) to see if a page's simhash
-    is near-duplicate of any previously seen page. If no duplicate is found, it stores the simhash.
+    Checks a shelve-based cache (with thread safety) for near-duplicate pages.
+    The simhash_val is a numpy boolean array.
+    Duplicate if similarity (1 - normalized Hamming distance) >= threshold.
     """
     with lock:
         with shelve.open(cache_file) as cache:
             for key, stored_simhash in cache.items():
-                if is_duplicate(simhash_val, stored_simhash):
+                stored_array = np.array(stored_simhash, dtype=bool)
+                hamming_dist = np.sum(simhash_val != stored_array)
+                similarity = 1.0 - (hamming_dist / simhash_val.size)
+                if similarity >= threshold:
                     return True
             normalized = get_urlhash(url)
-            cache[normalized] = simhash_val
+            cache[normalized] = simhash_val.tolist()
     return False
 
 def extract_links(soup, base_url):
@@ -136,7 +98,7 @@ def extract_links(soup, base_url):
 def scraper(url, resp):
     """
     Entry point for the crawler.
-    Calls extract_next_links and then filters the returned list of URLs using is_valid.
+    Calls extract_next_links and then filters the returned URLs using is_valid.
     """
     links = extract_next_links(url, resp)
     return [link for link in links if is_valid(link)]
@@ -150,8 +112,8 @@ def extract_next_links(url, resp):
       2. Parse HTML using BeautifulSoup.
       3. Honor meta robots directives: if "noindex" is present, skip the page;
          if "nofollow" is present, update word statistics but do not extract links.
-      4. Compute a simhash fingerprint and check for duplicate pages.
-      5. Update word analysis (for reporting longest page and common words).
+      4. Compute a simhash fingerprint (using EnhancedSimHash from simhash.py) and check for duplicates.
+      5. Update word analysis (for reporting: longest page, common words).
       6. Extract outbound links (defragmented and absolute).
     Returns a list of candidate hyperlinks.
     """
@@ -164,7 +126,7 @@ def extract_next_links(url, resp):
     
     soup = BeautifulSoup(content, "html.parser")
     
-    # Honor meta robots: check for noindex/nofollow directives.
+    # Honor meta robots: skip page if "noindex"; if "nofollow", update words only.
     meta_robots = soup.find("meta", attrs={"name": "robots"})
     if meta_robots:
         robots_content = meta_robots.get("content", "").lower()
@@ -176,24 +138,27 @@ def extract_next_links(url, resp):
             getWords(soup, lock, url)
             return []
     
-    # Duplicate detection: compute simhash and update duplicate cache.
-    simhash_val = compute_simhash(soup)
-    if update_duplicate_cache(url, simhash_val, lock):
+    # Duplicate detection using EnhancedSimHash from simhash.py
+    # Decode content to string for the simhash function.
+    html_str = content.decode("utf-8", errors="ignore")
+    simhash_instance = EnhancedSimHash()
+    doc_simhash = simhash_instance.compute_document_hash(html_str)
+    if update_duplicate_cache_np(url, doc_simhash, lock, threshold=simhash_instance.threshold):
         logger.info(f"Duplicate page detected: {url}")
         return []
     
-    # Update word statistics (for longest page and common words report).
+    # Update word statistics (for longest page and common words report)
     page_word_count = getWords(soup, lock, url)
     logger.info(f"Processed {url} with {page_word_count} words.")
     
-    # Extract and return outbound links.
+    # Extract outbound links
     raw_links = extract_links(soup, resp.raw_response.url)
     return raw_links
 
 def is_valid(url):
     """
     Decide whether to crawl this URL or not.
-    Uniqueness for this assignment is based solely on the URL (ignoring fragments).
+    Uniqueness is based solely on the URL (ignoring fragments).
     
     Conditions:
       - URL must use http or https.
@@ -223,7 +188,6 @@ def is_valid(url):
             return False
 
         return True
-
     except TypeError:
         print("TypeError for ", parsed)
         raise
