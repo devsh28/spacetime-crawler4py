@@ -7,12 +7,14 @@ from crawler import Crawler
 
 
 def main(config_file, restart):
-    cparser = ConfigParser()
-    cparser.read(config_file)
-    config = Config(cparser)
-    config.cache_server = get_cache_server(config, restart)
-    crawler = Crawler(config, restart)
-    crawler.start()
+    try:
+        config = Config(ConfigParser())
+        config.cache_server = get_cache_server(config, restart)
+        crawler = Crawler(config, restart)
+        crawler.start()
+    finally:
+        from scraper import write_report
+        write_report()
 
 
 if __name__ == "__main__":

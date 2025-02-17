@@ -12,6 +12,10 @@ class Frontier(object):
         self.logger = get_logger("FRONTIER")
         self.config = config
         self.to_be_downloaded = list()
+        self.restart = restart  # Store restart status
+
+        #clean shelve files when restart
+        self.cleanup_shelve_files()
         
         if not os.path.exists(self.config.save_file) and not restart:
             # Save file does not exist, but request to load save.
@@ -35,6 +39,34 @@ class Frontier(object):
                 for url in self.config.seed_urls:
                     self.add_url(url)
 
+    def cleanup_shelve_files(self):
+
+        if self.restart:
+            shelve_files = [
+                'words.shelve',
+                'dupe_cache.shelve',
+                'subdomains.shelve',
+                'cache.shelve'
+            ]
+            for file in shelve_files:
+                if os.path.exists(file):
+                    try:
+                        os.remove(file)
+                        self.logger.info(f"Deleted {file}")
+                    except Exception as e:
+                        self.logger.error(f"Error deleting {file}: {e}")
+                        
+            # Also remove any .db, .dir, .dat files associated with shelves
+            for file in shelve_files:
+                for ext in ['.db', '.dir', '.dat']:
+                    full_path = file + ext
+                    if os.path.exists(full_path):
+                        try:
+                            os.remove(full_path)
+                            self.logger.info(f"Deleted {full_path}")
+                        except Exception as e:
+                            self.logger.error(f"Error deleting {full_path}: {e}")
+
     def _parse_save_file(self):
         ''' This function can be overridden for alternate saving techniques. '''
         total_count = len(self.save)
@@ -54,19 +86,34 @@ class Frontier(object):
             return None
 
     def add_url(self, url):
-        url = normalize(url)
-        urlhash = get_urlhash(url)
-        if urlhash not in self.save:
-            self.save[urlhash] = (url, False)
-            self.save.sync()
-            self.to_be_downloaded.append(url)
+        try:
+            url = normalize(url)
+            urlhash = get_urlhash(url)
+            if urlhash not in self.save:
+                self.save[urlhash] = (url, False)
+                self.save.sync()
+                self.to_be_downloaded.append(url)
+        except Exception as e:
+            self.logger.error(f"Error adding URL {url}: {e}")
     
     def mark_url_complete(self, url):
-        urlhash = get_urlhash(url)
-        if urlhash not in self.save:
-            # This should not happen.
-            self.logger.error(
-                f"Completed url {url}, but have not seen it before.")
+        try:
+            urlhash = get_urlhash(url)
+            if urlhash not in self.save:
+                # This should not happen.
+                self.logger.error(
+                    f"Completed url {url}, but have not seen it before.")
+            else:
+                self.save[urlhash] = (url, True)
+                self.save.sync()
+        except Exception as e:
+            self.logger.error(f"Error marking URL complete {url}: {e}")
 
-        self.save[urlhash] = (url, True)
-        self.save.sync()
+    def __del__(self):
+        """
+        Cleanup when the frontier is destroyed.
+        """
+        try:
+            self.save.close()
+        except Exception as e:
+            self.logger.error(f"Error closing save file: {e}")
