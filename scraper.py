@@ -1,15 +1,16 @@
 import re
 import os
 import shelve
+import threading
 from urllib.parse import urlparse, urljoin, urldefrag, urlunparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 from utils import get_logger, get_urlhash
 
+# Global logger and lock
 logger = get_logger("SCRAPER", "SCRAPER")
+lock = threading.Lock()
 
-# ------------------------------------------------------------------
-# Stop Words and Word Analysis for Reporting (Longest page, common words)
-# ------------------------------------------------------------------
+
 stop_words = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "arent", "as", "at",
     "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "cant", "cannot", "could",
@@ -66,9 +67,7 @@ def getWords(soup, lock, url, limit=50):
                 word_store['*'] = (num_words, url)
     return num_words
 
-# ------------------------------------------------------------------
-# Simhash Functions for Duplicate Detection
-# ------------------------------------------------------------------
+
 def compute_simhash(soup, hashbits=64):
     """
     Computes a 64-bit simhash fingerprint from the page text.
@@ -83,8 +82,7 @@ def compute_simhash(soup, hashbits=64):
 
     v = [0] * hashbits
     for token, weight in freq.items():
-        # Use Python's built-in hash; mask to 64 bits.
-        h = hash(token) & ((1 << hashbits) - 1)
+        h = hash(token) & ((1 << hashbits) - 1)  # mask to 64 bits
         for i in range(hashbits):
             bitmask = 1 << i
             if h & bitmask:
@@ -120,39 +118,6 @@ def update_duplicate_cache(url, simhash_val, lock, cache_file="dupe_cache.shelve
             cache[normalized] = simhash_val
     return False
 
-# ------------------------------------------------------------------
-# URL and Link Extraction Helpers
-# ------------------------------------------------------------------
-def allowed_url(url):
-    """
-    Returns True if the URL:
-      - Uses http or https.
-      - Belongs to an allowed UCI domain.
-      - Does not have a disallowed file extension.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return False
-
-    allowed_domains = ("ics.uci.edu", "cs.uci.edu", "informatics.uci.edu", "stat.uci.edu")
-    if not any(parsed.netloc.endswith(domain) for domain in allowed_domains):
-        return False
-
-    ext_pattern = (
-        r".*\.(css|js|bmp|gif|jpe?g|ico"
-        r"|png|tiff?|mid|mp2|mp3|mp4"
-        r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-        r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
-        r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
-        r"|epub|dll|cnf|tgz|sha1"
-        r"|thmx|mso|arff|rtf|jar|csv"
-        r"|rm|smil|wmv|swf|wma|zip|rar|gz)$"
-    )
-    if re.match(ext_pattern, parsed.path.lower()):
-        return False
-
-    return True
-
 def extract_links(soup, base_url):
     """
     Extracts all hyperlinks from the page.
@@ -161,7 +126,6 @@ def extract_links(soup, base_url):
     links = []
     for a in soup.find_all("a", href=True):
         href = a.get("href")
-        # Skip non-HTTP schemes
         if href.startswith("mailto:") or href.startswith("javascript:"):
             continue
         abs_url = urljoin(base_url, href)
@@ -169,34 +133,38 @@ def extract_links(soup, base_url):
         links.append(clean_url)
     return links
 
-# ------------------------------------------------------------------
-# Main Scraper Function
-# ------------------------------------------------------------------
-def scraper(url, resp, lock):
+def scraper(url, resp):
     """
-    Main scraper function.
+    Entry point for the crawler.
+    Calls extract_next_links and then filters the returned list of URLs using is_valid.
+    """
+    links = extract_next_links(url, resp)
+    return [link for link in links if is_valid(link)]
+
+def extract_next_links(url, resp):
+    """
+    Processes the response and extracts outbound hyperlinks.
     
-    Process:
-      1. Verify response status and that content is HTML.
-      2. Parse the HTML with BeautifulSoup.
-      3. Honor meta robots directives (noindex/nofollow).
-      4. Compute a simhash fingerprint and use it to avoid near-duplicate pages.
-      5. Update word counts for reporting (longest page, common words).
-      6. Extract and filter outbound links (normalize URLs by removing fragments).
-    
-    The data collected (unique pages, longest page, word frequencies, subdomain counts)
-    will be used to generate the assignment report.
+    Steps:
+      1. Verify response status and HTML content.
+      2. Parse HTML using BeautifulSoup.
+      3. Honor meta robots directives: if "noindex" is present, skip the page;
+         if "nofollow" is present, update word statistics but do not extract links.
+      4. Compute a simhash fingerprint and check for duplicate pages.
+      5. Update word analysis (for reporting longest page and common words).
+      6. Extract outbound links (defragmented and absolute).
+    Returns a list of candidate hyperlinks.
     """
     if resp.status != 200:
         return []
-
+    
     content = resp.raw_response.content
     if not content or b"<html" not in content.lower():
         return []
-
+    
     soup = BeautifulSoup(content, "html.parser")
-
-    # Honor meta robots: skip page if "noindex"; if "nofollow", do not extract links.
+    
+    # Honor meta robots: check for noindex/nofollow directives.
     meta_robots = soup.find("meta", attrs={"name": "robots"})
     if meta_robots:
         robots_content = meta_robots.get("content", "").lower()
@@ -207,19 +175,55 @@ def scraper(url, resp, lock):
             logger.info(f"Nofollow directive found for {url}; updating words only.")
             getWords(soup, lock, url)
             return []
-
-    # Compute simhash for duplicate detection
+    
+    # Duplicate detection: compute simhash and update duplicate cache.
     simhash_val = compute_simhash(soup)
     if update_duplicate_cache(url, simhash_val, lock):
         logger.info(f"Duplicate page detected: {url}")
         return []
-
-    # Update word statistics (for longest page and common words report)
+    
+    # Update word statistics (for longest page and common words report).
     page_word_count = getWords(soup, lock, url)
     logger.info(f"Processed {url} with {page_word_count} words.")
-
-    # Extract outbound links and filter them using allowed_url criteria.
-    raw_links = extract_links(soup, resp.raw_response.url)
-    valid_links = [link for link in raw_links if allowed_url(link)]
     
-    return valid_links
+    # Extract and return outbound links.
+    raw_links = extract_links(soup, resp.raw_response.url)
+    return raw_links
+
+def is_valid(url):
+    """
+    Decide whether to crawl this URL or not.
+    Uniqueness for this assignment is based solely on the URL (ignoring fragments).
+    
+    Conditions:
+      - URL must use http or https.
+      - URL must belong to one of the allowed UCI domains.
+      - URL must not point to unwanted file types (based on file extension).
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+
+        allowed_domains = ("ics.uci.edu", "cs.uci.edu", "informatics.uci.edu", "stat.uci.edu")
+        if not any(parsed.netloc.endswith(domain) for domain in allowed_domains):
+            return False
+
+        ext_pattern = (
+            r".*\.(css|js|bmp|gif|jpe?g|ico"
+            r"|png|tiff?|mid|mp2|mp3|mp4"
+            r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
+            r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
+            r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
+            r"|epub|dll|cnf|tgz|sha1"
+            r"|thmx|mso|arff|rtf|jar|csv"
+            r"|rm|smil|wmv|swf|wma|zip|rar|gz)$"
+        )
+        if re.match(ext_pattern, parsed.path.lower()):
+            return False
+
+        return True
+
+    except TypeError:
+        print("TypeError for ", parsed)
+        raise
