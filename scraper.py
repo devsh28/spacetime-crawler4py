@@ -89,139 +89,20 @@ def update_duplicate_cache_np(url, simhash_val, lock, cache_file="dupe_cache.she
 # -----------------------------
 # URL Filtering and Link Extraction
 # -----------------------------
-def extract_next_links(url, resp):
+def extract_links(soup, base_url):
     """
-    Processes the response and extracts outbound hyperlinks.
-    
-    Args:
-        url (str): The URL that was crawled
-        resp (Response): Response object containing status and content
-    
-    Returns:
-        list: List of valid URLs extracted from the page
+    Extracts all hyperlinks from the page.
+    Converts relative URLs to absolute using the base URL and defragments them.
     """
-    # 1. Initial response validation
-    if resp is None:
-        logger.error(f"No response object for URL: {url}")
-        return []
-        
-    if resp.status != 200:
-        logger.error(f"Bad status code {resp.status} for URL: {url}")
-        return []
-        
-    if resp.raw_response is None:
-        logger.error(f"No raw response for URL: {url}")
-        return []
-
-    # 2. Content validation
-    try:
-        content = resp.raw_response.content
-        if not content:
-            logger.error(f"Empty content for URL: {url}")
-            return []
-            
-        # Check if content is HTML
-        if not is_html(content):
-            logger.info(f"Skipping non-HTML content at {url}")
-            return []
-            
-    except Exception as e:
-        logger.error(f"Error accessing content for {url}: {e}")
-        return []
-
-    # 3. Parse HTML
-    try:
-        soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
-    except Exception as e:
-        logger.error(f"BeautifulSoup parsing error for {url}: {e}")
-        return []
-
-    # 4. Check robots meta tags
-    try:
-        if meta_robots := soup.find("meta", attrs={"name": "robots"}):
-            robots_content = meta_robots.get("content", "").lower()
-            if "noindex" in robots_content:
-                logger.info(f"Skipping {url} due to noindex directive")
-                return []
-            if "nofollow" in robots_content:
-                logger.info(f"Nofollow directive found for {url}; updating words only")
-                getWords(soup, lock, url)
-                return []
-    except Exception as e:
-        logger.error(f"Error checking robots meta for {url}: {e}")
-
-    # 5. Check for infinite traps
-    if infinite_trap_detect(url):
-        logger.info(f"Skipping {url} due to potential infinite trap")
-        return []
-
-    # 6. Extract and process links
     links = []
-    try:
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag.get("href", "").strip()
-            
-            # Skip empty or javascript links
-            if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
-                continue
-
-            # Convert relative to absolute URL
-            try:
-                absolute_url = urljoin(resp.raw_response.url, href)
-                # Remove fragments
-                clean_url, _ = urldefrag(absolute_url)
-                
-                # Basic URL validation
-                if not clean_url.startswith(('http://', 'https://')):
-                    continue
-                    
-                # Add valid URL to list
-                if clean_url != url:  # Avoid self-links
-                    links.append(clean_url)
-                    
-            except Exception as e:
-                logger.error(f"Error processing link {href} from {url}: {e}")
-                continue
-
-    except Exception as e:
-        logger.error(f"Error extracting links from {url}: {e}")
-        return []
-
-    # 7. Process page content for word analysis
-    try:
-        page_word_count = getWords(soup, lock, url)
-        logger.info(f"Processed {url} with {page_word_count} words")
-    except Exception as e:
-        logger.error(f"Error processing words for {url}: {e}")
-
-    # 8. Update subdomain statistics
-    try:
-        update_subdomain_count(url, lock)
-    except Exception as e:
-        logger.error(f"Error updating subdomain count for {url}: {e}")
-
-    # 9. Log summary
-    logger.info(f"Extracted {len(links)} links from {url}")
-    
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
+        if href.startswith("mailto:") or href.startswith("javascript:"):
+            continue
+        abs_url = urljoin(base_url, href)
+        clean_url, _ = urldefrag(abs_url)
+        links.append(clean_url)
     return links
-
-def is_html(content):
-    """
-    Check if content is HTML by looking for common HTML markers
-    """
-    try:
-        # Check for PDF
-        if content.startswith(b'%PDF'):
-            return False
-            
-        # Look for HTML markers
-        content_lower = content.lower()
-        return (b'<html' in content_lower or 
-                b'<head' in content_lower or 
-                b'<body' in content_lower or 
-                b'<!doctype html' in content_lower)
-    except Exception:
-        return False
 
 # -----------------------------
 # Subdomain Analysis Functions
