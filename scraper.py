@@ -177,63 +177,135 @@ def extract_next_links(url, resp):
     """
     Processes the response and extracts outbound hyperlinks.
     
-    Steps:
-      1. Verify response status and HTML content.
-      2. Parse HTML using BeautifulSoup.
-      3. Honor meta robots directives: if "noindex" is present, skip the page;
-         if "nofollow" is present, update word statistics but do not extract links.
-      4. Compute a simhash fingerprint (using EnhancedSimHash from simhash.py) and check for duplicates.
-      5. Update word analysis (for reporting: longest page, common words).
-      6. Update subdomain analysis for pages under ics.uci.edu.
-      7. Check for infinite crawler traps.
-      8. Extract outbound links (defragmented and absolute).
-    Returns a list of candidate hyperlinks.
+    Args:
+        url (str): The URL that was crawled
+        resp (Response): Response object containing status and content
+    
+    Returns:
+        list: List of valid URLs extracted from the page
     """
+    # 1. Initial response validation
+    if resp is None:
+        logger.error(f"No response object for URL: {url}")
+        return []
+        
     if resp.status != 200:
+        logger.error(f"Bad status code {resp.status} for URL: {url}")
         return []
-    
-    content = resp.raw_response.content
-    if not content or b"<html" not in content.lower():
+        
+    if resp.raw_response is None:
+        logger.error(f"No raw response for URL: {url}")
         return []
-    
-    soup = BeautifulSoup(content, "html.parser")
-    
-    # Honor meta robots: skip page if "noindex"; if "nofollow", update words only.
-    meta_robots = soup.find("meta", attrs={"name": "robots"})
-    if meta_robots:
-        robots_content = meta_robots.get("content", "").lower()
-        if "noindex" in robots_content:
-            logger.info(f"Skipping {url} due to noindex directive.")
+
+    # 2. Content validation
+    try:
+        content = resp.raw_response.content
+        if not content:
+            logger.error(f"Empty content for URL: {url}")
             return []
-        if "nofollow" in robots_content:
-            logger.info(f"Nofollow directive found for {url}; updating words only.")
-            getWords(soup, lock, url)
+            
+        # Check if content is HTML
+        if not is_html(content):
+            logger.info(f"Skipping non-HTML content at {url}")
             return []
-    
-    # Infinite trap detection: check for repeated segments or date patterns.
+            
+    except Exception as e:
+        logger.error(f"Error accessing content for {url}: {e}")
+        return []
+
+    # 3. Parse HTML
+    try:
+        soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
+    except Exception as e:
+        logger.error(f"BeautifulSoup parsing error for {url}: {e}")
+        return []
+
+    # 4. Check robots meta tags
+    try:
+        if meta_robots := soup.find("meta", attrs={"name": "robots"}):
+            robots_content = meta_robots.get("content", "").lower()
+            if "noindex" in robots_content:
+                logger.info(f"Skipping {url} due to noindex directive")
+                return []
+            if "nofollow" in robots_content:
+                logger.info(f"Nofollow directive found for {url}; updating words only")
+                getWords(soup, lock, url)
+                return []
+    except Exception as e:
+        logger.error(f"Error checking robots meta for {url}: {e}")
+
+    # 5. Check for infinite traps
     if infinite_trap_detect(url):
-        logger.info(f"Skipping {url} due to potential infinite trap.")
+        logger.info(f"Skipping {url} due to potential infinite trap")
         return []
-    
-    # Duplicate detection using EnhancedSimHash from simhash.py
-    # Decode content to string for the simhash function.
-    html_str = content.decode("utf-8", errors="ignore")
-    simhash_instance = EnhancedSimHash()
-    doc_simhash = simhash_instance.compute_document_hash(html_str)
-    if update_duplicate_cache_np(url, doc_simhash, lock, threshold=simhash_instance.threshold):
-        logger.info(f"Duplicate page detected: {url}")
+
+    # 6. Extract and process links
+    links = []
+    try:
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "").strip()
+            
+            # Skip empty or javascript links
+            if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                continue
+
+            # Convert relative to absolute URL
+            try:
+                absolute_url = urljoin(resp.raw_response.url, href)
+                # Remove fragments
+                clean_url, _ = urldefrag(absolute_url)
+                
+                # Basic URL validation
+                if not clean_url.startswith(('http://', 'https://')):
+                    continue
+                    
+                # Add valid URL to list
+                if clean_url != url:  # Avoid self-links
+                    links.append(clean_url)
+                    
+            except Exception as e:
+                logger.error(f"Error processing link {href} from {url}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error extracting links from {url}: {e}")
         return []
+
+    # 7. Process page content for word analysis
+    try:
+        page_word_count = getWords(soup, lock, url)
+        logger.info(f"Processed {url} with {page_word_count} words")
+    except Exception as e:
+        logger.error(f"Error processing words for {url}: {e}")
+
+    # 8. Update subdomain statistics
+    try:
+        update_subdomain_count(url, lock)
+    except Exception as e:
+        logger.error(f"Error updating subdomain count for {url}: {e}")
+
+    # 9. Log summary
+    logger.info(f"Extracted {len(links)} links from {url}")
     
-    # Update word statistics (for longest page and common words report)
-    page_word_count = getWords(soup, lock, url)
-    logger.info(f"Processed {url} with {page_word_count} words.")
-    
-    # Update subdomain analysis (for pages under ics.uci.edu)
-    update_subdomain_count(url, lock)
-    
-    # Extract outbound links
-    raw_links = extract_links(soup, resp.raw_response.url)
-    return raw_links
+    return links
+
+def is_html(content):
+    """
+    Check if content is HTML by looking for common HTML markers
+    """
+    try:
+        # Check for PDF
+        if content.startswith(b'%PDF'):
+            return False
+            
+        # Look for HTML markers
+        content_lower = content.lower()
+        return (b'<html' in content_lower or 
+                b'<head' in content_lower or 
+                b'<body' in content_lower or 
+                b'<!doctype html' in content_lower)
+    except Exception:
+        return False
 
 def is_valid(url):
     """
