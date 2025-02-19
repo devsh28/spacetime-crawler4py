@@ -197,6 +197,11 @@ def extract_next_links(url, resp):
         logger.error(f"No raw response for URL: {url}")
         return []
 
+    # Additional check: Ensure raw_response has required attributes
+    if not hasattr(resp.raw_response, "content") or not hasattr(resp.raw_response, "url"):
+        logger.error(f"raw_response missing required attributes for URL: {url}")
+        return []
+
     # 2. Content validation
     try:
         content = resp.raw_response.content
@@ -245,7 +250,7 @@ def extract_next_links(url, resp):
         for a_tag in soup.find_all("a", href=True):
             href = a_tag.get("href", "").strip()
             
-            # Skip empty or javascript links
+            # Skip empty or javascript/mailto/tel or fragment links
             if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
                 continue
 
@@ -259,8 +264,8 @@ def extract_next_links(url, resp):
                 if not clean_url.startswith(('http://', 'https://')):
                     continue
                     
-                # Add valid URL to list
-                if clean_url != url:  # Avoid self-links
+                # Add valid URL to list, avoiding self-links
+                if clean_url != url:
                     links.append(clean_url)
                     
             except Exception as e:
@@ -340,7 +345,7 @@ def is_valid(url):
         if re.match(ext_pattern, parsed.path.lower()):
             return False
 
-        # Additional infinite tra n p detection: Check for repeated path segments
+        # Additional infinite trap detection: Check for repeated path segments
         path_segments = [seg for seg in parsed.path.split("/") if seg]
         segment_counts = {}
         for seg in path_segments:
@@ -359,9 +364,9 @@ def is_valid(url):
             return False
 
         return True
-    except TypeError:
-        print("TypeError for ", parsed)
-        raise
+    except Exception as e:
+        logger.error(f"Error in is_valid for {url}: {e}")
+        return False
 
 def write_report(report_filename="report.txt"):
     """
@@ -411,4 +416,3 @@ def write_report(report_filename="report.txt"):
         f.write("-" * 25 + "\n")
         for subdomain, count in sorted_subdomains:
             f.write(f"{subdomain}, {count}\n")
-
