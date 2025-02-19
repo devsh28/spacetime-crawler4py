@@ -312,7 +312,7 @@ def is_html(content):
     except Exception:
         return False
 
-def is_valid(url):
+def is_valid(url, ignore_cache=False):
     """
     Decide whether to crawl this URL or not.
     Uniqueness is based solely on the URL (ignoring fragments) and avoiding traps.
@@ -322,6 +322,8 @@ def is_valid(url):
       - URL must belong to one of the allowed UCI domains.
       - URL must not point to unwanted file types (based on file extension).
       - URL must not trigger infinite crawler traps.
+    
+    Additionally, if ignore_cache is False, the URL is added to "cache.shelve" to ensure it's only crawled once.
     """
     try:
         parsed = urlparse(url)
@@ -363,7 +365,18 @@ def is_valid(url):
         if re.search(r"\b\d{4}-\d{2}\b", parsed.path) is not None:
             return False
 
+        # Cache unique URLs visited if ignore_cache is False
+        if not ignore_cache:
+            # Use get_urlhash to compute a normalized hash for the URL
+            urlhash = get_urlhash(url)
+            with lock:
+                with shelve.open("cache.shelve") as cache:
+                    if urlhash in cache:
+                        return False
+                    cache[urlhash] = (url, None)
+        
         return True
+
     except Exception as e:
         logger.error(f"Error in is_valid for {url}: {e}")
         return False
@@ -377,7 +390,7 @@ def write_report(report_filename="report.txt"):
       4. The subdomain analysis for pages under ics.uci.edu.
     The report is written to a text file.
     """
-    # 1. Unique Pages: Count keys in the duplicate cache
+    # 1. Unique Pages: Count keys in the unique URL cache
     with shelve.open("cache.shelve") as cache:
         unique_count = len(cache)
     
